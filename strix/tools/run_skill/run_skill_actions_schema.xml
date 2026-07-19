@@ -1,0 +1,28 @@
+<tool_description>
+    <tool_name>execute_skill</tool_name>
+    <description>
+        Execute a specialized cybersecurity skill script from the built-in library.
+        Use this tool to run pre-built automation scripts (like XSS scanners, SQLi validators, etc.) instead of writing custom Python code.
+        The scripts are maintained in the 'skills' directory and are optimized for specific vulnerability testing.
+    </description>
+    <parameters>
+        <parameter>
+            <name>skill_name</name>
+            <type>string</type>
+            <description>The name of the skill category (e.g., 'testing-for-xss-vulnerabilities').</description>
+            <required>true</required>
+        </parameter>
+        <parameter>
+            <name>script_name</name>
+            <type>string</type>
+            <description>The specific script file to execute (e.g., 'xss_scanner.py').</description>
+            <required>true</required>
+        </parameter>
+        <parameter>
+            <name>arguments</name>
+            <type>string</type>
+            <description>Arguments to pass to the script (e.g., '--url http://target.com/search?q=test').</description>
+            <required>false</required>
+        </parameter>
+    </parameters>
+</tool_description>

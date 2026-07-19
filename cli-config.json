@@ -1,0 +1,14 @@
+{
+  "env": {
+    "DOCKER_HOST": "ssh://sallam@167.86.80.22",
+    "STRIX_SANDBOX_MODE": "true",
+    "LLM_API_BASE": "https://openrouter.ai/api/v1",
+    "STRIX_LLM": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+    "LLM_API_KEY": "YOUR_OPENROUTER_KEY",
+    "STRIX_SINGLE_AGENT": "true",
+    "STRIX_COMPACT_PROMPT": "true",
+    "LLM_TIMEOUT": "300",
+    "STRIX_MAX_OUTPUT_TOKENS": "8192",
+    "STRIX_MAX_TOOL_OUTPUT_CHARS": "3000"
+  }
+}
