@@ -448,13 +448,26 @@ class DockerRuntime(AbstractRuntime):
         """Clear the previous scan's state from the warm container so the new
         scan starts isolated without restarting the container.
 
-        Steps:
+        No-op on the very first scan in a warm container: there is no previous
+        state to reset (fresh bootstrap already produced a clean /workspace and
+        a fresh Caido project). This avoids hitting Caido/tool-server endpoints
+        before they are ready and is the source of the scan-1 "Initializing" hang.
+
+        Steps (only when a previous scan exists):
           1. Cancel the previous agent's in-flight tool tasks + terminal sessions
              via POST /reset_agent on the tool server.
           2. Wipe /workspace (the previous scan's copied sources).
           3. Create a fresh temporary Caido project and select it, so proxy
              captures from the new scan land in a clean project.
         """
+        # First scan in this warm container: nothing to reset. Bootstrap already
+        # produced clean state. (Also covers the case where the runtime was
+        # re-created in-process after a Python restart while the warm container
+        # survived — _recover_container_state repopulates ports/token but we
+        # can't know the prior Caido project, so reset is unsafe.)
+        if not self._warm_scan_ids:
+            return
+
         if self._tool_server_port is None or self._tool_server_token is None:
             raise RuntimeError("Tool server not initialized for warm reset")
 
@@ -486,6 +499,11 @@ class DockerRuntime(AbstractRuntime):
                 await self._switch_caido_project(scan_id, token)
 
     async def _call_reset_agent(self, api_url: str, agent_id: str, token: str) -> None:
+        # Reset is entirely best-effort. A 404 here means the in-container tool
+        # server is an older image that predates the /reset_agent endpoint —
+        # safe to ignore, the warm reset still proceeds (the previous scan's
+        # terminal sessions will simply time out or be overwritten). Never let
+        # this raise: it would abort create_sandbox and the whole scan.
         try:
             async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.post(
@@ -495,9 +513,15 @@ class DockerRuntime(AbstractRuntime):
                     timeout=30,
                 )
                 response.raise_for_status()
-        except httpx.RequestError:
-            # Reset is best-effort; a fresh container simply has nothing to reset.
-            pass
+        except httpx.HTTPError as e:
+            # HTTPError is the base for both RequestError (network) and
+            # HTTPStatusError (4xx/5xx, e.g. 404 from a stale image).
+            import warnings
+
+            warnings.warn(
+                f"reset_agent best-effort call failed (ignored): {e}",
+                stacklevel=2,
+            )
 
     async def _switch_caido_project(self, scan_id: str, caido_token: str) -> None:
         """Create a fresh temporary Caido project and select it as current.
