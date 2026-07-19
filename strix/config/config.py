@@ -51,6 +51,11 @@ class Config:
     strix_sandbox_execution_timeout = "120"
     strix_sandbox_connect_timeout = "10"
     docker_host = None
+    # Warm sandbox: reuse one container across scans (startup ~0s on 2nd scan vs 30-60s).
+    # Per-scan reset (terminal sessions, /workspace, Caido project) preserves isolation.
+    strix_warm_sandbox = "true"
+    # Terminal executor backend: "tmux" (libtmux, 0.5s poll) or "go" (event-driven PTY).
+    strix_terminal_backend = "tmux"
 
     # Telemetry
     strix_telemetry = "1"

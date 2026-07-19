@@ -135,6 +135,37 @@ async def register_agent(
     return {"status": "registered", "agent_id": agent_id}
 
 
+@app.post("/reset_agent")
+async def reset_agent(
+    agent_id: str, credentials: HTTPAuthorizationCredentials = security_dependency
+) -> dict[str, str]:
+    """Cancel in-flight tool tasks and close terminal sessions for an agent.
+
+    Used by the warm-sandbox per-scan reset to clear the previous scan's
+    state from the reused container without restarting it.
+    """
+    verify_token(credentials)
+
+    # Cancel any in-flight tool task for this agent (mirrors the cancellation
+    # logic in /execute when a newer request arrives).
+    old_task = agent_tasks.pop(agent_id, None)
+    if old_task is not None and not old_task.done():
+        old_task.cancel()
+
+    # Close persistent terminal sessions (libtmux/PTY) the agent opened.
+    # Lazy import: terminal manager pulls in libtmux which is sandbox-only.
+    try:
+        from strix.tools.terminal import get_terminal_manager
+
+        get_terminal_manager().cleanup_agent(agent_id)
+    except Exception:  # noqa: BLE001
+        # Terminal cleanup is best-effort; reset must not fail if the terminal
+        # backend is unavailable or raises.
+        pass
+
+    return {"status": "reset", "agent_id": agent_id}
+
+
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     return {

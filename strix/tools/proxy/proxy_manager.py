@@ -29,7 +29,34 @@ class ProxyManager:
         }
         self.auth_token = auth_token or os.getenv("CAIDO_API_TOKEN")
 
+    def _refresh_token(self) -> None:
+        """Re-fetch a fresh Caido guest token via loginAsGuest.
+
+        Caido guest tokens have a TTL. In warm-sandbox mode the container
+        lives across many scans, so a token obtained at container bootstrap can
+        expire mid-session. Call this on 401 (TransportQueryError) or when the
+        token is missing to recover without restarting the container.
+        """
+        try:
+            resp = requests.post(
+                self.base_url,
+                json={
+                    "query": "mutation LoginAsGuest { loginAsGuest { token { accessToken } } }"
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            token = resp.json()["data"]["loginAsGuest"]["token"]["accessToken"]
+        except (RequestException, KeyError, ValueError):
+            # Cannot refresh — leave the existing (possibly stale) token so the
+            # caller surfaces the real error from the next GraphQL call.
+            return
+        self.auth_token = token
+        os.environ["CAIDO_API_TOKEN"] = token
+
     def _get_client(self) -> Client:
+        if not self.auth_token:
+            self._refresh_token()
         transport = RequestsHTTPTransport(
             url=self.base_url, headers={"Authorization": f"Bearer {self.auth_token}"}
         )

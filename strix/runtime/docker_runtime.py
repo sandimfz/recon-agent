@@ -45,6 +45,23 @@ class DockerRuntime(AbstractRuntime):
         self._tool_server_token: str | None = None
         self._caido_port: int | None = None
 
+        # Warm sandbox: reuse one long-lived container across scans instead of
+        # creating one per scan_id. Bootstrap (Caido + tool server) runs once;
+        # per-scan isolation is provided by the reset sequence in create_sandbox.
+        self._warm = str(Config.get("strix_warm_sandbox")).lower() in ("true", "1", "yes")
+        # Guards against double-copying sources within the same scan if
+        # create_sandbox is called twice for one agent_id. In warm mode we do
+        # NOT dedup across scans — the reset clears /workspace every time.
+        self._warm_scan_ids: set[str] = set()
+        # Tracks the active Caido project id so a new scan can switch away from
+        # (and optionally delete) the previous one.
+        self._current_caido_project_id: str | None = None
+
+        if self._warm:
+            import atexit
+
+            atexit.register(self.shutdown)
+
     def _find_available_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
@@ -113,8 +130,18 @@ class DockerRuntime(AbstractRuntime):
             "Container initialization timed out. Please try again.",
         )
 
+    def _container_name(self, scan_id: str) -> str:
+        """Stable name `strix-scan-warm` in warm mode (reused across scans),
+        per-scan `strix-scan-{scan_id}` otherwise."""
+        return "strix-scan-warm" if self._warm else f"strix-scan-{scan_id}"
+
+    def _container_scan_label(self, scan_id: str) -> str:
+        """Label value for `strix-scan-id` — constant in warm mode so a reused
+        container keeps one label, scan-specific otherwise."""
+        return "warm" if self._warm else scan_id
+
     def _create_container(self, scan_id: str, max_retries: int = 2) -> Container:
-        container_name = f"strix-scan-{scan_id}"
+        container_name = self._container_name(scan_id)
         image_name = Config.get("strix_image")
         if not image_name:
             raise ValueError("STRIX_IMAGE must be configured")
@@ -147,7 +174,7 @@ class DockerRuntime(AbstractRuntime):
                         f"{CONTAINER_CAIDO_PORT}/tcp": self._caido_port,
                     },
                     cap_add=["NET_ADMIN", "NET_RAW"],
-                    labels={"strix-scan-id": scan_id},
+                    labels={"strix-scan-id": self._container_scan_label(scan_id)},
                     environment={
                         "PYTHONUNBUFFERED": "1",
                         "TOOL_SERVER_PORT": str(CONTAINER_TOOL_SERVER_PORT),
@@ -160,6 +187,8 @@ class DockerRuntime(AbstractRuntime):
                 )
 
                 self._scan_container = container
+                self._warm_scan_ids.clear()
+                self._current_caido_project_id = None
                 self._wait_for_tool_server()
 
             except (DockerException, RequestsConnectionError, RequestsTimeout) as e:
@@ -178,7 +207,7 @@ class DockerRuntime(AbstractRuntime):
         ) from last_error
 
     def _get_or_create_container(self, scan_id: str) -> Container:
-        container_name = f"strix-scan-{scan_id}"
+        container_name = self._container_name(scan_id)
 
         if self._scan_container:
             try:
@@ -261,8 +290,19 @@ class DockerRuntime(AbstractRuntime):
         scan_id = self._get_scan_id(agent_id)
         container = self._get_or_create_container(scan_id)
 
-        source_copied_key = f"_source_copied_{scan_id}"
-        if local_sources and not hasattr(self, source_copied_key):
+        # In warm mode the container is reused across scans. Clear the previous
+        # scan's state (terminal sessions, /workspace, Caido project) so the
+        # new scan starts clean — this is the isolation mechanism that lets a
+        # single long-lived container serve multiple scans safely.
+        if self._warm and scan_id not in self._warm_scan_ids:
+            await self._warm_reset(agent_id, scan_id, container)
+            self._warm_scan_ids.add(scan_id)
+
+        # Guard against double-copying sources within the same scan if
+        # create_sandbox is called twice for one agent_id (e.g. subagent reuse).
+        # In non-warm mode this also dedups the very first copy for a scan_id.
+        should_copy_sources = scan_id not in self._warm_scan_ids or not self._warm
+        if local_sources and should_copy_sources:
             for index, source in enumerate(local_sources, start=1):
                 source_path = source.get("source_path")
                 if not source_path:
@@ -276,7 +316,9 @@ class DockerRuntime(AbstractRuntime):
             if skills_dir.exists():
                 self._copy_local_directory_to_container(container, str(skills_dir), "skills")
 
-            setattr(self, source_copied_key, True)
+            if not self._warm:
+                # Legacy per-scan dedup marker (cold mode only).
+                setattr(self, f"_source_copied_{scan_id}", True)
 
         if container.id is None:
             raise RuntimeError("Docker container ID is unexpectedly None")
@@ -331,6 +373,8 @@ class DockerRuntime(AbstractRuntime):
         return "127.0.0.1"
 
     async def destroy_sandbox(self, container_id: str) -> None:
+        # Note: never called by the agent (dead code in the cold path). Kept for
+        # interface completeness; warm mode tears down via shutdown().
         try:
             container = self.client.containers.get(container_id)
             container.stop()
@@ -343,6 +387,16 @@ class DockerRuntime(AbstractRuntime):
             pass
 
     def cleanup(self) -> None:
+        # In warm mode the container survives across CLI invocations — the
+        # per-exit teardown at cli.py/tui.py must NOT kill it. Only clear the
+        # in-process references; the actual container stays running.
+        if self._warm:
+            self._scan_container = None
+            self._tool_server_port = None
+            self._tool_server_token = None
+            self._caido_port = None
+            return
+
         if self._scan_container is not None:
             container_name = self._scan_container.name
             self._scan_container = None
@@ -361,3 +415,160 @@ class DockerRuntime(AbstractRuntime):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+
+    def shutdown(self) -> None:
+        """Explicit teardown of a warm container on process exit."""
+        if self._scan_container is None:
+            return
+        container_name = self._scan_container.name
+        self._scan_container = None
+        self._tool_server_port = None
+        self._tool_server_token = None
+        self._caido_port = None
+        self._warm_scan_ids.clear()
+        self._current_caido_project_id = None
+
+        if container_name is None:
+            return
+
+        import subprocess
+
+        with contextlib.suppress(Exception):
+            subprocess.run(  # noqa: S603
+                ["docker", "rm", "-f", container_name],  # noqa: S607
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=30,
+            )
+
+    async def _warm_reset(
+        self, agent_id: str, scan_id: str, container: Container
+    ) -> None:
+        """Clear the previous scan's state from the warm container so the new
+        scan starts isolated without restarting the container.
+
+        Steps:
+          1. Cancel the previous agent's in-flight tool tasks + terminal sessions
+             via POST /reset_agent on the tool server.
+          2. Wipe /workspace (the previous scan's copied sources).
+          3. Create a fresh temporary Caido project and select it, so proxy
+             captures from the new scan land in a clean project.
+        """
+        if self._tool_server_port is None or self._tool_server_token is None:
+            raise RuntimeError("Tool server not initialized for warm reset")
+
+        host = self._resolve_docker_host()
+        api_url = f"http://{host}:{self._tool_server_port}"
+        token = self._tool_server_token
+
+        # Step 1 — cancel prev agent's terminal sessions + in-flight tool tasks.
+        await self._call_reset_agent(api_url, agent_id, token)
+
+        # Step 2 — wipe /workspace of the previous scan's sources. Keep the
+        # directory itself (it is WORKDIR); restore ownership/permissions so the
+        # pentester user can write to it after the fresh copy.
+        with contextlib.suppress(Exception):
+            container.exec_run(
+                "find /workspace -mindepth 1 -delete",
+                user="root",
+            )
+            container.exec_run(
+                "chown -R pentester:pentester /workspace && chmod -R 755 /workspace",
+                user="root",
+            )
+
+        # Step 3 — fresh Caido project for proxy isolation. Best-effort: if
+        # Caido is unreachable (e.g. proxy tools unused this scan), the reset
+        # still succeeds for the workspace + terminal state.
+        if self._caido_port is not None:
+            with contextlib.suppress(Exception):
+                await self._switch_caido_project(scan_id, token)
+
+    async def _call_reset_agent(self, api_url: str, agent_id: str, token: str) -> None:
+        try:
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.post(
+                    f"{api_url}/reset_agent",
+                    params={"agent_id": agent_id},
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30,
+                )
+                response.raise_for_status()
+        except httpx.RequestError:
+            # Reset is best-effort; a fresh container simply has nothing to reset.
+            pass
+
+    async def _switch_caido_project(self, scan_id: str, caido_token: str) -> None:
+        """Create a fresh temporary Caido project and select it as current.
+
+        The guest token is fetched fresh via loginAsGuest to sidestep TTL
+        expiry on long-lived warm containers. selectProject is the isolation
+        mechanism — new proxy captures land in the new project.
+        """
+        if self._caido_port is None:
+            return
+        host = self._resolve_docker_host()
+        graphql_url = f"http://{host}:{self._caido_port}/graphql"
+
+        async with httpx.AsyncClient(trust_env=False) as client:
+            # Fresh guest token (instance-scoped, not project-scoped).
+            login_resp = await client.post(
+                graphql_url,
+                json={
+                    "query": "mutation LoginAsGuest { loginAsGuest { token { accessToken } } }"
+                },
+                timeout=30,
+            )
+            login_resp.raise_for_status()
+            token = login_resp.json()["data"]["loginAsGuest"]["token"]["accessToken"]
+
+            headers = {"Authorization": f"Bearer {token}"}
+
+            # Optionally delete the previous scan's project to prevent
+            # accumulation of temporary projects.
+            prev_id = self._current_caido_project_id
+            if prev_id:
+                with contextlib.suppress(Exception):
+                    await client.post(
+                        graphql_url,
+                        headers=headers,
+                        json={
+                            "query": "mutation DeleteProject($id: ID!) { deleteProject(id: $id) { deleted } }",
+                            "variables": {"id": prev_id},
+                        },
+                        timeout=30,
+                    )
+
+            # Create + select the new project.
+            create_resp = await client.post(
+                graphql_url,
+                headers=headers,
+                json={
+                    "query": (
+                        "mutation CreateProject($name: String!) {"
+                        " createProject(input: {name: $name, temporary: true})"
+                        " { project { id } } }"
+                    ),
+                    "variables": {"name": f"scan-{scan_id}"},
+                },
+                timeout=30,
+            )
+            create_resp.raise_for_status()
+            new_id = create_resp.json()["data"]["createProject"]["project"]["id"]
+
+            select_resp = await client.post(
+                graphql_url,
+                headers=headers,
+                json={
+                    "query": (
+                        "mutation SelectProject($id: ID!) {"
+                        " selectProject(id: $id) { currentProject { project { id } } } }"
+                    ),
+                    "variables": {"id": new_id},
+                },
+                timeout=30,
+            )
+            select_resp.raise_for_status()
+
+        self._current_caido_project_id = new_id
