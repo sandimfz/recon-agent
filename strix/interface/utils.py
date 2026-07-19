@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -459,7 +460,7 @@ def generate_run_name(targets_info: list[dict[str, Any]] | None = None) -> str:
     base_label = _derive_target_label_for_run_name(targets_info)
     slug = _slugify_for_run_name(base_label)
 
-    random_suffix = secrets.token_hex(2)
+    random_suffix = secrets.token_hex(4)
 
     return f"{slug}_{random_suffix}"
 
