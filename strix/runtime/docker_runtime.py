@@ -296,7 +296,11 @@ class DockerRuntime(AbstractRuntime):
         # single long-lived container serve multiple scans safely.
         if self._warm and scan_id not in self._warm_scan_ids:
             await self._warm_reset(agent_id, scan_id, container)
-            self._warm_scan_ids.add(scan_id)
+            # NOTE: scan_id is added to _warm_scan_ids AFTER the source-copy
+            # block below, not here. Adding it here would make the
+            # should_copy_sources guard see the scan as already-sourced on the
+            # very first call, so warm-mode first scans would never copy their
+            # local_sources into /workspace.
 
         # Guard against double-copying sources within the same scan if
         # create_sandbox is called twice for one agent_id (e.g. subagent reuse).
@@ -319,6 +323,12 @@ class DockerRuntime(AbstractRuntime):
             if not self._warm:
                 # Legacy per-scan dedup marker (cold mode only).
                 setattr(self, f"_source_copied_{scan_id}", True)
+
+        # Mark this scan as reset+sourced so a subsequent create_sandbox call
+        # for the same scan_id (subagent reuse) skips the warm reset and the
+        # source copy. Added after the copy block so the first call still copies.
+        if self._warm:
+            self._warm_scan_ids.add(scan_id)
 
         if container.id is None:
             raise RuntimeError("Docker container ID is unexpectedly None")
